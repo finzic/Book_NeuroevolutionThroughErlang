@@ -18,7 +18,7 @@
 -define(NEURAL_COST,100).
 -define(PLANT_AGELIMIT,2000).
 -define(FL_AGELIMIT,10000).
--define(PLANT_GROWTH,off).
+-define(PLANT_GROWTH,on).
 -define(SPAWN_LOC,[{1,[0,0]},{2,[2500,0]},{3,[5000,0]},{4,[5000,2500]},{5,[5000,5000]},{6,[2500,5000]},{7,[0,5000]},{8,[0,2500]}]).
 -define(SECTOR_SIZE,10).
 %%==================================================================== API
@@ -141,7 +141,7 @@ handle_call({enter,Morphology,Specie_Id,CF,CT,TotNeurons,Exoself_PId},{From_PId,
 				{Visor_PId,Canvas} ->
 					visor:draw_avatar(Canvas,create_avatar(Morphology,Specie_Id,Exoself_PId,Stats,void))
 			end,
-			io:format("Avatar2:~p~n",[Avatar]),
+			%io:format("Avatar2:~p~n",[Avatar]),
 			{done,State#scape{avatars = [Avatar|Avatars]}}
 	end,
 	{reply,Reply,U_State};
@@ -456,7 +456,7 @@ create_avatar(Morphology,Specie_Id,Id,Stats,Parameters)->
 create_avatar(Morphology,Specie_Id,Id,{CF,CT,TotNeurons},void,InitEnergy) when (Morphology == predator)  or (Morphology == prey) or (Morphology == automaton)->
 	case Morphology of
 		predator->
-			io:format("Creating Predator:~p~n",[{CF,CT,Id}]),
+			io:format("Creating Predator:~p~n",[Id]),
 			%{CF,CT,TotNeurons} = Stats,
 			Color = red,
 			%Color=visor:ct2color(CT),
@@ -493,7 +493,7 @@ create_avatar(Morphology,Specie_Id,Id,{CF,CT,TotNeurons},void,InitEnergy) when (
 				stats = TotNeurons
 			};
 		prey ->
-			io:format("Creating Prey:~p~n",[{CF,CT,Id}]),
+			io:format("Creating Prey:~p~n",[Id]),
 			%{CF,CT,TotNeurons} = Stats,
 			Direction = {DX,DY} = {1/math:sqrt(2),1/math:sqrt(2)},
 			{X,Y} = {random:uniform(800),random:uniform(500)},
@@ -690,7 +690,7 @@ destroy_avatar(ExoSelf_PId,State)->
 				undefined->
 					done;
 				{Visor_PId,_Canvas} ->
-					io:format("Avatar:~p~n",[Avatar]),
+					%io:format("Avatar:~p~n",[Avatar]),
 					[gs:destroy(Id) || {_ObjType,Id,_Color,_Pivot,_Coords,_Parameter} <- Avatar#avatar.objects]
 			end
 	end,
@@ -876,7 +876,7 @@ world_init(World_Type,Physics,Metabolics)->
 			Walls = create_walls(),
 			Plants=[create_avatar(plant,plant,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(10,1)],
 			Poisons=[create_avatar(poison,poison,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(10,1)],
-			Plants;%++Walls++Poisons
+			Plants++Walls++Poisons;
 		baator ->
 			Id=genotype:generate_UniqueId(),
 			Plants=[create_avatar(plant,plant,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(10,1)],
