@@ -22,7 +22,7 @@
 	apids=[],
 	private_scape_pids=[],
 	public_scape_pids=[],
-	highest_fitness=-1,
+	highest_fitness=-1.0e9,
 	eval_acc=0,
 	cycle_acc=0,
 	time_acc=0,

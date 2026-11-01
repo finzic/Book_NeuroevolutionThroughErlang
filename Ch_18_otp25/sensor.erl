@@ -81,28 +81,43 @@ dtm_GetInput(Exoself,VL,Parameters,Scape)->
 	end.
 	
 distance_scanner(Exoself_PId,VL,[Spread,Density,RadialOffset],Scape)->
-	case gen_server:call(Scape,{get_all,avatars,Exoself_PId}) of
+	%Reads the scape's avatar table directly (see flatland:avatars/2), not via a scape call.
+	case flatland:avatars(Scape,Exoself_PId) of
 		destroyed->
 			lists:duplicate(VL,-1);
-		Avatars ->
-			Self = lists:keyfind(Exoself_PId,2,Avatars),
-			Loc = Self#avatar.loc,
-			Direction = Self#avatar.direction,
-			Result=distance_scanner(silent,{1,0,0},Density,Spread,Loc,Direction,lists:keydelete(Exoself_PId, 2, Avatars)),
-			Result
+		{Self,Others} ->
+			%Closeness instead of raw pixels (which saturated tanh): 1 touching ... 0 at ?SEE_RANGE or beyond, or nothing hit.
+			[closeness(D) || D <- distance_scanner(silent,{1,0,0},Density,Spread,Self#avatar.loc,Self#avatar.direction,Others)]
+	end.
+
+-define(SEE_RANGE,300).
+closeness(D) when D < 0 -> 0;
+closeness(D) -> max(0,1-D/?SEE_RANGE).
+
+%% The nearest predator within ?SEE_RANGE, wherever it is (also behind the agent, where the
+%% rays cannot see): [closeness, sine, cosine] of its bearing relative to the agent's heading,
+%% or [0,0,0] when none is near. This is what lets a prey learn to flee.
+threat_scanner(Exoself_PId,VL,_Parameters,Scape)->
+	case flatland:avatars(Scape,Exoself_PId) of
+		destroyed->
+			lists:duplicate(VL,0);
+		{#avatar{loc={X,Y},direction={DX,DY}},Others} ->
+			Near = [{math:sqrt(math:pow(PX-X,2)+math:pow(PY-Y,2)),PX-X,PY-Y} || #avatar{type=predator,loc={PX,PY}} <- Others],
+			case lists:sort(Near) of
+				[{D,VX,VY}|_] when D > 0, D < ?SEE_RANGE ->
+					[1-D/?SEE_RANGE,(DX*VY-DY*VX)/D,(DX*VX+DY*VY)/D];
+				_ ->
+					[0,0,0]
+			end
 	end.
 
 color_scanner(Exoself_PId,VL,[Spread,Density,RadialOffset],Scape)->
-	case gen_server:call(Scape,{get_all,avatars,Exoself_PId}) of
+	%Reads the scape's avatar table directly (see flatland:avatars/2), not via a scape call.
+	case flatland:avatars(Scape,Exoself_PId) of
 		destroyed->
 			lists:duplicate(VL,-1);
-		Avatars ->%io:format("Avatars:~p~n",[Avatars]),
-			Self = lists:keyfind(Exoself_PId,2,Avatars),
-			%io:format("Self:~p~n",[Self]),
-			Loc = Self#avatar.loc,
-			Direction = Self#avatar.direction,
-			Result=color_scanner(silent,{1,0,0},Density,Spread,Loc,Direction,lists:keydelete(Exoself_PId, 2, Avatars)),
-			Result
+		{Self,Others} ->
+			color_scanner(silent,{1,0,0},Density,Spread,Self#avatar.loc,Self#avatar.direction,Others)
 	end.
 	
 %Input: ViewAngle= Radian, Density= n, Gaze direction= {SensorLoc,Direction}.

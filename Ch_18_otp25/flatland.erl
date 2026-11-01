@@ -28,6 +28,11 @@
 -define(POISONS,50).
 %Plants and poisons spawn anywhere in the arena except a stripe this wide along every border.
 -define(FOOD_MARGIN,20).
+-define(PREY_STEP_FITNESS,0.001).
+-define(PREDATOR_STEP_FITNESS,0.0001).
+%A prey speared by a predator loses this much fitness: far more than the 0.001 per step it
+%earns by surviving (20 for the longest possible life, a few for a typical one).
+-define(PREY_DEATH_PENALTY,5).
 %Random interior walls: ?WALL_SHAPES pieces, each 1..3 connected sides at right angles
 %(bar, L, U or Z), never touching each other or the arena border, so no closed box can form.
 -define(WALL_SHAPES,7).
@@ -73,14 +78,24 @@ init(Parameters) ->
 		{Polis_PId,Scape_Type,Physics,Metabolics} ->
 			Init_Avatars = world_init(Scape_Type,Physics,Metabolics),
 %			io:format("InitAvatars:~p~n",[InitAvatars]),
+			{Walls,Movables} = lists:partition(fun(A)-> A#avatar.type == wall end,Init_Avatars),
 			#scape{id=self(),
 				type = Scape_Type,
-				avatars = Init_Avatars,
+				avatars = avatar_map(Movables),
+				walls = Walls,
+				sector2avatars = grid_build(Movables),
 				physics = Physics,
 				metabolics = Metabolics
 			}
 	end,
+	avatar_table_init(InitState),
 	{ok, InitState}.
+
+%% Every callback ends by mirroring the avatars it changed into the avatar table
+%% (see avatar_table_init/1), so sensors always read the state the scape replied with.
+handle_call(Request,From,State)-> avatar_table_sync(scape_call(Request,From,State)).
+handle_cast(Msg,State)-> avatar_table_sync(scape_cast(Msg,State)).
+handle_info(Info,State)-> avatar_table_sync(scape_info(Info,State)).
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -91,7 +106,7 @@ init(Parameters) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({actuator,Exoself_PId,Command,Output},{From_PId,_Ref}=From,State)->
+scape_call({actuator,Exoself_PId,Command,Output},{From_PId,_Ref}=From,State)->
 	%timer:sleep(10),
 	%io:format("########################: ~p~n",[now()]),
 	{FitnessP,U_State}=case get(Exoself_PId) of
@@ -101,24 +116,17 @@ handle_call({actuator,Exoself_PId,Command,Output},{From_PId,_Ref}=From,State)->
 		destroyed ->
 			erase(Exoself_PId),
 			io:format("Avatar:~p destroyed.~n",[Exoself_PId]),
-			{{0,1},State};
+			{{-case erase({death_penalty,Exoself_PId}) of undefined -> 0; Penalty -> Penalty end,1},State};
 		_ ->
-			Avatars = State#scape.avatars,
-			Avatar = lists:keyfind(Exoself_PId, 2, Avatars),
+			Avatar = maps:get(Exoself_PId,State#scape.avatars),
 			U_Avatar = flatland:Command(Avatar#avatar{kills=0},Output),
 			case (U_Avatar#avatar.energy > 0) and (U_Avatar#avatar.age < 20000) of
 				true ->
-					Age = U_Avatar#avatar.age,
-					Fitness = case Age > 1000 of
-						true ->
-							0.001+Avatar#avatar.kills*1;
-						false ->
-							0.001+Avatar#avatar.kills*1
-					end,
+					Fitness = step_fitness(U_Avatar#avatar.type,Avatar#avatar.kills),
 					%Collisions may also push other avatars (plants, poisons, prey), so all are kept inside.
+					%(collision_detection/2 puts the mover itself back into the list.)
 					B_Avatar = check_borders(U_Avatar,?ARENA),
-					U_Avatars = collision_detection(B_Avatar,lists:keyreplace(Exoself_PId, 2, Avatars, B_Avatar)),
-					{{Fitness,0},State#scape{avatars = [keep_in_arena(A) || A <- U_Avatars]}};
+					{{Fitness,0},collision_detection(B_Avatar,State)};
 				false ->
 					io:format("Avatar:~p died at age:~p~n",[U_Avatar#avatar.id,U_Avatar#avatar.age]),
 					visor_death(U_Avatar,case U_Avatar#avatar.energy > 0 of true -> old_age; false -> starved end),
@@ -128,53 +136,52 @@ handle_call({actuator,Exoself_PId,Command,Output},{From_PId,_Ref}=From,State)->
 	put(sim_steps,sim_steps()+1),
 	visor_publish(U_State),
 	paced_reply(From_PId,From,FitnessP,U_State);
-handle_call({multi_agent,update_agents,U_Avatars},{Exoself_PId,_Ref},State)->
-	{reply,ok,State#scape{avatars=U_Avatars}};
-handle_call({get_all,avatars,Exoself_PId},{From_PId,_Ref},State)->
+scape_call({multi_agent,update_agents,U_Avatars},{Exoself_PId,_Ref},State)->
+	{reply,ok,set_avatars(U_Avatars,State)};
+scape_call({get_all,avatars,Exoself_PId},{From_PId,_Ref},State)->
 	Reply =case get(Exoself_PId) of
 		destroyed ->
 			destroyed;
 		_ ->
-			State#scape.avatars
+			avatar_list(State)
 	end,
 	{reply,Reply,State};
-handle_call(tick,{From_PId,_Ref},State)->
-	Avatars = State#scape.avatars,
-	U_Avatars = flatland:metabolics(Avatars,[]),
-	U_State = State#scape{avatars = U_Avatars},
+scape_call(tick,{From_PId,_Ref},State)->
+	U_State = metabolize(State),
 	put(ticks,tick_count()+1),
 	visor_publish(U_State),
 	{reply,done,U_State};
-handle_call({enter,Morphology,Specie_Id,CF,CT,TotNeurons,Exoself_PId},{From_PId,_Ref},State)->
+scape_call({enter,Morphology,Specie_Id,CF,CT,TotNeurons,Exoself_PId},{From_PId,_Ref},State)->
 	{Reply,U_State}=case get(Exoself_PId) of
 		entered ->
 			io:format("Already Registered Citizen:~p~n",[Exoself_PId]),
 			{undefined,State};
-		undefined ->
+		%destroyed: killed between two evaluations (book bug: crashed the scape); it simply re-enters.
+		Status when Status == undefined; Status == destroyed ->
 			Stats = {CF,CT,TotNeurons},
-			Avatars = State#scape.avatars,
 			put(Exoself_PId,entered),
+			erase({death_penalty,Exoself_PId}),
 %			io:format("Avatar:~p entered~n",[Exoself_PId]),
 			Avatar=create_avatar(Morphology,Specie_Id,Exoself_PId,Stats,void),
-			{done,State#scape{avatars = [Avatar|Avatars]}}
+			{done,put_avatar(Avatar,State)}
 	end,
 	visor_publish(U_State),
 	{reply,Reply,U_State};
-handle_call({leave,Exoself_PId},{From_PId,_Ref},State)->
+scape_call({leave,Exoself_PId},{From_PId,_Ref},State)->
 	U_State=destroy_avatar(Exoself_PId,State),
 %	io:format("Avatar left:~p~n",[Exoself_PId]),
 	visor_publish(U_State),
 	{reply,done,U_State};
-handle_call({visor,subscribe,Visor_PId,MaxHz},_From,State)->
+scape_call({visor,subscribe,Visor_PId,MaxHz},_From,State)->
 	Tab = visor_subscribe(Visor_PId,MaxHz,State),
 	io:format("Visor:~p subscribed to scape:~p~n",[Visor_PId,self()]),
 	{reply,{ok,Tab},State};
-handle_call({_Visor_PId,unsubscribe},_From,State)->
+scape_call({_Visor_PId,unsubscribe},_From,State)->
 	visor_unsubscribe(),
 	{reply,done,State};
-handle_call({stop,normal},_From, State)->
+scape_call({stop,normal},_From, State)->
 	{stop, normal, State};
-handle_call({stop,shutdown},_From,State)->
+scape_call({stop,shutdown},_From,State)->
 	{stop, shutdown, State}.
 
 %%--------------------------------------------------------------------
@@ -183,25 +190,25 @@ handle_call({stop,shutdown},_From,State)->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast({_Visor_PId,unsubscribe},State)->
+scape_cast({_Visor_PId,unsubscribe},State)->
 	visor_unsubscribe(),
 	{noreply,State};
-handle_cast({visor,pace,Cmd},State)->
+scape_cast({visor,pace,Cmd},State)->
 	visor_pace_command(Cmd),
 	visor_publish_now(State),
 	{noreply,State};
-handle_cast(tick,State)->
+scape_cast(tick,State)->
 	case visor_pace:paused(pace()) of
 		true -> {noreply,State};
 		false -> metabolic_tick(State)
 	end;
-handle_cast({init,InitState},_State)->
+scape_cast({init,InitState},_State)->
 	{noreply,InitState};
-handle_cast({_Polis_PId,stop,normal},State)->
+scape_cast({_Polis_PId,stop,normal},State)->
 	{stop, normal,State};
-handle_cast({stop,normal},State)->
+scape_cast({stop,normal},State)->
 	{stop, normal,State};
-handle_cast({stop,shutdown},State)->
+scape_cast({stop,shutdown},State)->
 	{stop, shutdown, State}.
 
 metabolic_tick(State)->
@@ -223,9 +230,7 @@ metabolic_tick(State)->
 %			{metabolics(Avatars,[]),Scheduler+1}
 %	end,
 
-	Avatars = State#scape.avatars,
-	U_Avatars = flatland:metabolics(Avatars,[]),
-	U_State = State#scape{avatars = U_Avatars},%#scape{avatars = U_Avatars,scheduler=U_Scheduler}};
+	U_State = metabolize(State),
 	put(ticks,tick_count()+1),
 	visor_publish(U_State),
 	{noreply,U_State}.
@@ -235,18 +240,18 @@ metabolic_tick(State)->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_info({'DOWN',MRef,process,_Visor_PId,_Reason},State)->
+scape_info({'DOWN',MRef,process,_Visor_PId,_Reason},State)->
 	case get(visor) of
 		#{mref := MRef} -> visor_unsubscribe();
 		_ -> ok
 	end,
 	{noreply,State};
-handle_info({visor_pace,From,Reply},State)->
+scape_info({visor_pace,From,Reply},State)->
 	{Action,Pace}=visor_pace:on_timer(pace(),From,Reply),
 	put(visor_pace,Pace),
 	Action == reply andalso gen_server:reply(From,Reply),
 	{noreply,State};
-handle_info(_Info, State) ->
+scape_info(_Info, State) ->
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -258,7 +263,76 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 terminate(Reason, State) ->
 	io:format("Scape:~p~n Terminating with reason:~p~n",[self(),Reason]),
+	catch persistent_term:erase({?MODULE,avatars,self()}),
 	ok.
+
+%%==================================================================== avatar table
+%% Sensors need every avatar on every step (two scanners per agent). Replying with
+%% the whole avatar list copied ~240 records out of the scape per read, and since the
+%% scape is a single process that copying was most of its work at max speed. Instead
+%% the scape mirrors its avatars into a protected ETS table, rewriting only the
+%% avatars that changed, and sensors read the table themselves (avatars/2), so the
+%% copying happens in parallel in the sensor processes. The scape's own map is the
+%% source of truth; the table is a read-only view of it. write_concurrency matters:
+%% without it every scape write waited for the sensors' table scans (half the speed).
+avatar_table_init(State)->
+	Tab = ets:new(?MODULE,[set,protected,{keypos,#avatar.id},{read_concurrency,true},{write_concurrency,true}]),
+	ets:insert(Tab,State#scape.walls),%walls never change
+	ets:insert(Tab,maps:values(State#scape.avatars)),
+	put(avatar_table,Tab),
+	put(dirty,#{}),
+	persistent_term:put({?MODULE,avatars,self()},Tab).
+
+avatar_table_sync(Result)->
+	case Result of
+		{reply,_,State} -> avatar_table_sync_state(State);
+		{noreply,State} -> avatar_table_sync_state(State);
+		_ -> ok
+	end,
+	Result.
+
+%Only the avatars marked dirty since the last callback are written (or deleted) in the table.
+avatar_table_sync_state(#scape{avatars = Avatars})->
+	case erase(dirty) of
+		Dirty when map_size(Dirty) > 0 ->
+			Tab = get(avatar_table),
+			maps:foreach(fun(Id,_)->
+				case Avatars of
+					#{Id := A} -> ets:insert(Tab,A);
+					_ -> ets:delete(Tab,Id)
+				end
+			end,Dirty);
+		_ ->
+			ok
+	end,
+	put(dirty,#{});
+avatar_table_sync_state(_)->
+	ok.
+
+mark_dirty(Id)->
+	put(dirty,(get(dirty))#{Id => true}).
+
+mark_all_dirty(Avatars)->
+	put(dirty,maps:merge(get(dirty),maps:map(fun(_,_)-> true end,Avatars))).
+
+%Called by sensors: all avatars as {Self,Others}, or destroyed when the caller's
+%avatar is not in the scape (eaten, left, or the scape is gone).
+avatars(Scape,Exoself_PId)->
+	All = case persistent_term:get({?MODULE,avatars,Scape},undefined) of
+		undefined ->
+			gen_server:call(Scape,{get_all,avatars,Exoself_PId});
+		Tab ->
+			try ets:tab2list(Tab) catch error:badarg -> destroyed end
+	end,
+	case All of
+		destroyed ->
+			destroyed;
+		_ ->
+			case lists:keytake(Exoself_PId,#avatar.id,All) of
+				{value,Self,Others} -> {Self,Others};
+				false -> destroyed
+			end
+	end.
 
 %%--------------------------------------------------------------------
 %% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
@@ -310,7 +384,7 @@ visor_publish_now(State)->
 
 visor_snapshot(State)->
 	Stats = #{scape => State#scape.type, steps => sim_steps(), ticks => tick_count()},
-	Frame = visor_frame:from_avatars(State#scape.avatars,maps:merge(Stats,visor_pace:info(pace()))),
+	Frame = visor_frame:from_avatars(State#scape.walls ++ maps:values(State#scape.avatars),maps:merge(Stats,visor_pace:info(pace()))),
 	[{XMin,XMax},{YMin,YMax}] = ?ARENA,
 	Frame#{deaths => death_log(), bounds => {XMin,YMin,XMax,YMax}}.
 
@@ -465,82 +539,170 @@ check_borders(Avatar,[{XMin,XMax},{YMin,YMax}])->
 			Avatar#avatar{loc = {X+DX,Y+DY},objects = U_Objects}
 	end.
 
+%Fitness earned per step: 1 per kill (prey eaten by a predator, plant eaten by a prey) plus a survival
+%bonus. For predators the bonus is ten times smaller than for prey: otherwise standing still to live
+%long (about 5 points) scores better than hunting, and predators never learn to hunt.
+step_fitness(predator,Kills)-> ?PREDATOR_STEP_FITNESS+Kills;
+step_fitness(_Type,Kills)-> ?PREY_STEP_FITNESS+Kills.
+
 keep_in_arena(Avatar = #avatar{type = T, loc = {X,Y}}) when T =/= wall, is_number(X), is_number(Y) ->
 	check_borders(Avatar,?ARENA);
 keep_in_arena(Avatar) ->
 	Avatar.
 
-collision_detection(OperatorAvatar,Avatars)->
-	collision_detection(OperatorAvatar,0,0,Avatars,[]).
-collision_detection(OperatorAvatar,EnergyAcc,Kills,[Avatar|Avatars],Acc)->
-	%io:format("OAvatar:~p Avatar:~p~n",[OperatorAvatar,Avatar]),
-	if
-		(Avatar#avatar.id == OperatorAvatar#avatar.id)->
-			collision_detection(OperatorAvatar,EnergyAcc,Kills,Avatars,[Avatar|Acc]);
-		(Avatar#avatar.type == wall) ->
-			U_OperatorAvatar = world_wall_collision(OperatorAvatar,Avatar),
-			collision_detection(U_OperatorAvatar,EnergyAcc,Kills,Avatars,[Avatar|Acc]);
-		true ->
-			{X,Y}= OperatorAvatar#avatar.loc,
-			{DX,DY} = OperatorAvatar#avatar.direction,
-			{Xav,Yav}=Avatar#avatar.loc,
-			Penetration=case (OperatorAvatar#avatar.type == predator) or (OperatorAvatar#avatar.spear == true) of
-				true ->
-					Spear_UnitRay = {DX*math:cos(0) - DY*math:sin(0), DX*math:sin(0) + DY*math:cos(0)},
-					{InterDist,_Color}=sensor:shortest_intrLine({{X,Y},Spear_UnitRay},[Avatar],{inf,void}),
-					(InterDist =/= -1) and (InterDist < (2 + OperatorAvatar#avatar.r));%TODO, spear length should be avatar defined, not 2.
-				false ->
-					false
-			end,
-			Distance = math:sqrt(math:pow(X-Xav,2)+math:pow(Y-Yav,2)),
-			Collision = (Distance < (OperatorAvatar#avatar.r+Avatar#avatar.r)),
-			{Energy,Order,U_OperatorAvatar,U_Avatar}= case Collision or Penetration of
-				true ->
-					world_behavior(Collision,Penetration,OperatorAvatar,Avatar);
-				false ->
-					{0,void,OperatorAvatar,Avatar}
-			end,
-			case Order of
-				destroy ->
-					put(U_Avatar#avatar.id,destroyed),
-					visor_death(U_Avatar,{eaten,U_OperatorAvatar#avatar.type}),
-					collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills+1,Avatars,Acc);
-				plant_eaten->
-					Kill_Score = case Energy > 0 of
-						true ->
-							1;
-						false ->
-							0
-					end,
-					case U_Avatar#avatar.state of
-						no_respawn->
-							collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills+Kill_Score,Avatars,Acc);
-						respawn ->
-							RespawnedAvatar = respawn_avatar([Avatar|Avatars]++Acc,U_Avatar),
-							collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills+Kill_Score,Avatars,[RespawnedAvatar|Acc])
-					end;
-				poison_eaten->
-					case U_Avatar#avatar.state of
-						no_respawn->
-							collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills,Avatars,Acc);
-						respawn ->
-							RespawnedAvatar = respawn_avatar([Avatar|Avatars]++Acc,U_Avatar),
-							collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills,Avatars,[RespawnedAvatar|Acc])
-					end;
-				void ->
-					collision_detection(U_OperatorAvatar,EnergyAcc+Energy,Kills,Avatars,[U_Avatar|Acc])
-			end
-	end;
-collision_detection(OperatorAvatar,EnergyAcc,KillsAcc,[],Acc)->
-	case EnergyAcc =/= 0 of
-		true ->
-			Energy = OperatorAvatar#avatar.energy,
-			Kills = OperatorAvatar#avatar.kills,
-			U_OperatorAvatar = OperatorAvatar#avatar{energy=functions:saturation(Energy+EnergyAcc,10000), kills = KillsAcc+Kills},
-			lists:keyreplace(U_OperatorAvatar#avatar.id, 2, Acc, U_OperatorAvatar);
-		false ->
-			lists:keyreplace(OperatorAvatar#avatar.id, 2, Acc, OperatorAvatar)
+%%==================================================================== spatial grid
+%% The movable avatars live in a map Id => Avatar and, next to it, in a grid of
+%% square cells (Cell => [Id]), so an avatar only meets the ones near it instead of
+%% scanning all of them every step. Walls are static and few: they are kept apart in
+%% #scape.walls and always checked. ?CELL must be at least the farthest distance at
+%% which two avatars interact (spear reach 2+r+2r', at most 32), see ?QUERY_RADIUS.
+-define(CELL,40).
+-define(QUERY_RADIUS,40).
+
+avatar_map(Avatars)->
+	maps:from_list([{A#avatar.id,A} || A <- Avatars]).
+
+cell({X,Y})->
+	{floor(X/?CELL),floor(Y/?CELL)}.
+
+grid_build(Avatars)->
+	lists:foldl(fun(A,Grid)-> grid_add(A#avatar.id,A#avatar.loc,Grid) end,#{},Avatars).
+
+grid_add(Id,Loc,Grid)->
+	Cell = cell(Loc),
+	Grid#{Cell => [Id|maps:get(Cell,Grid,[])]}.
+
+grid_remove(Id,Loc,Grid)->
+	Cell = cell(Loc),
+	case lists:delete(Id,maps:get(Cell,Grid,[])) of
+		[] -> maps:remove(Cell,Grid);
+		Ids -> Grid#{Cell => Ids}
 	end.
+
+grid_move(Id,OldLoc,NewLoc,Grid)->
+	case cell(OldLoc) =:= cell(NewLoc) of
+		true -> Grid;
+		false -> grid_add(Id,NewLoc,grid_remove(Id,OldLoc,Grid))
+	end.
+
+%Ids in the cells covering the square of ?QUERY_RADIUS around Loc.
+grid_near({X,Y},Grid)->
+	{CX1,CY1} = cell({X-?QUERY_RADIUS,Y-?QUERY_RADIUS}),
+	{CX2,CY2} = cell({X+?QUERY_RADIUS,Y+?QUERY_RADIUS}),
+	lists:foldl(fun(Cell,Acc)->
+		case Grid of
+			#{Cell := Ids} -> Ids ++ Acc;
+			_ -> Acc
+		end
+	end,[],[{CX,CY} || CX <- lists:seq(CX1,CX2), CY <- lists:seq(CY1,CY2)]).
+
+avatar_list(State)->
+	State#scape.walls ++ maps:values(State#scape.avatars).
+
+%Replaces the whole movable population (update_agents, metabolics).
+set_avatars(List,State)->
+	{Walls,Movables} = lists:partition(fun(A)-> A#avatar.type == wall end,List),
+	Avatars = avatar_map(Movables),
+	mark_all_dirty(State#scape.avatars),
+	mark_all_dirty(Avatars),
+	State#scape{avatars = Avatars,
+		walls = case Walls of [] -> State#scape.walls; _ -> Walls end,
+		sector2avatars = grid_build(Movables)}.
+
+metabolize(State)->
+	set_avatars(metabolics(maps:values(State#scape.avatars),[]),State).
+
+put_avatar(Avatar,State)->
+	Id = Avatar#avatar.id,
+	Grid = case State#scape.avatars of
+		#{Id := Old} -> grid_move(Id,Old#avatar.loc,Avatar#avatar.loc,State#scape.sector2avatars);
+		_ -> grid_add(Id,Avatar#avatar.loc,State#scape.sector2avatars)
+	end,
+	mark_dirty(Id),
+	State#scape{avatars = (State#scape.avatars)#{Id => Avatar}, sector2avatars = Grid}.
+
+remove_avatar(Id,State)->
+	case State#scape.avatars of
+		#{Id := Old} ->
+			mark_dirty(Id),
+			State#scape{avatars = maps:remove(Id,State#scape.avatars),
+				sector2avatars = grid_remove(Id,Old#avatar.loc,State#scape.sector2avatars)};
+		_ ->
+			State
+	end.
+
+%% The operator has already moved. It is checked against the walls and then against the
+%% avatars of the cells around it; whatever it eats, kills or pushes is updated in
+%% the state, and the operator itself is stored last, with its energy and kills.
+collision_detection(OperatorAvatar,State)->
+	Walls_Operator = lists:foldl(fun(Wall,Op)-> world_wall_collision(Op,Wall) end,OperatorAvatar,State#scape.walls),
+	Id = OperatorAvatar#avatar.id,
+	Near = [N || N <- grid_near(Walls_Operator#avatar.loc,State#scape.sector2avatars), N =/= Id],
+	{U_Operator,EnergyAcc,Kills,U_State} = collide(Near,Walls_Operator,0,0,State),
+	Final = case EnergyAcc =/= 0 of
+		true ->
+			U_Operator#avatar{energy=functions:saturation(U_Operator#avatar.energy+EnergyAcc,10000), kills = Kills+U_Operator#avatar.kills};
+		false ->
+			U_Operator
+	end,
+	put_avatar(keep_in_arena(Final),U_State).
+
+collide([Id|Ids],OperatorAvatar,EnergyAcc,Kills,State)->
+	Avatar = maps:get(Id,State#scape.avatars),
+	{X,Y}= OperatorAvatar#avatar.loc,
+	{DX,DY} = OperatorAvatar#avatar.direction,
+	{Xav,Yav}=Avatar#avatar.loc,
+	Distance = math:sqrt(math:pow(X-Xav,2)+math:pow(Y-Yav,2)),
+	%A spear hit lies within 2+r of the attacker and every part of an avatar within
+	%2R of its centre (its own spear), so farther avatars need no ray test.
+	Reach = 2 + OperatorAvatar#avatar.r + 2*Avatar#avatar.r,
+	Penetration=case ((OperatorAvatar#avatar.type == predator) or (OperatorAvatar#avatar.spear == true)) andalso (Distance < Reach) of
+		true ->
+			Spear_UnitRay = {DX*math:cos(0) - DY*math:sin(0), DX*math:sin(0) + DY*math:cos(0)},
+			{InterDist,_Color}=sensor:shortest_intrLine({{X,Y},Spear_UnitRay},[Avatar],{inf,void}),
+			(InterDist =/= -1) and (InterDist < (2 + OperatorAvatar#avatar.r));%TODO, spear length should be avatar defined, not 2.
+		false ->
+			false
+	end,
+	Collision = (Distance < (OperatorAvatar#avatar.r+Avatar#avatar.r)),
+	{Energy,Order,U_OperatorAvatar,U_Avatar}= case Collision or Penetration of
+		true ->
+			world_behavior(Collision,Penetration,OperatorAvatar,Avatar);
+		false ->
+			{0,void,OperatorAvatar,Avatar}
+	end,
+	case Order of
+		destroy ->
+			put(U_Avatar#avatar.id,destroyed),
+			put({death_penalty,U_Avatar#avatar.id},death_penalty(U_Avatar,U_OperatorAvatar)),
+			visor_death(U_Avatar,{eaten,U_OperatorAvatar#avatar.type}),
+			collide(Ids,U_OperatorAvatar,EnergyAcc+Energy,Kills+1,remove_avatar(Id,State));
+		plant_eaten->
+			Kill_Score = case Energy > 0 of
+				true -> 1;
+				false -> 0
+			end,
+			collide(Ids,U_OperatorAvatar,EnergyAcc+Energy,Kills+Kill_Score,eaten_food(Id,U_Avatar,State));
+		poison_eaten->
+			collide(Ids,U_OperatorAvatar,EnergyAcc+Energy,Kills,eaten_food(Id,U_Avatar,State));
+		void when U_Avatar =:= Avatar ->
+			collide(Ids,U_OperatorAvatar,EnergyAcc+Energy,Kills,State);
+		void ->
+			%Pushed: the only other avatars that move this step, so keep them in the arena.
+			collide(Ids,U_OperatorAvatar,EnergyAcc+Energy,Kills,put_avatar(keep_in_arena(U_Avatar),State))
+	end;
+collide([],OperatorAvatar,EnergyAcc,Kills,State)->
+	{OperatorAvatar,EnergyAcc,Kills,State}.
+
+eaten_food(Id,Avatar,State)->
+	case Avatar#avatar.state of
+		no_respawn -> remove_avatar(Id,State);
+		respawn -> put_avatar(respawn_avatar([],Avatar),State)
+	end.
+
+%Only prey (no spear) eaten by a predator are penalised.
+death_penalty(#avatar{type = prey},#avatar{type = predator}) -> ?PREY_DEATH_PENALTY;
+death_penalty(_,_) -> 0.
 
 create_avatar(Morphology)->
 	create_avatar(Morphology,Morphology,genotype:generate_UniqueId(),{cf,ct,-1},respawn,undefined).
@@ -775,14 +937,14 @@ create_avatar(Morphology,Specie_Id,Id,undefined,Parameters,undefined) when (Morp
 	end.
 
 destroy_avatar(ExoSelf_PId,State)->
-	Avatars = State#scape.avatars,
 	case get(ExoSelf_PId) of
 		undefined ->
 			io:format("Destroy Avatar in Scape:: Undefined:~p~n",[ExoSelf_PId]);
-		entered->io:format("Destroying avatar associated with:~p~n",[ExoSelf_PId]),
+		Status when Status == entered; Status == destroyed ->
+			io:format("Destroying avatar associated with:~p~n",[ExoSelf_PId]),
 			erase(ExoSelf_PId)
 	end,
-	State#scape{avatars = lists:keydelete(ExoSelf_PId, 2, Avatars)}.
+	remove_avatar(ExoSelf_PId,State).
 
 respawn_avatar(A)->
 %	io:format("Respawning:~p~n",[A]),
@@ -971,9 +1133,8 @@ world_init(World_Type,Physics,Metabolics)->
 			Poisons=[create_avatar(poison,poison,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(?POISONS,1)],
 			Plants++Walls++Poisons;
 		baator ->
-			Id=genotype:generate_UniqueId(),
-			Plants=[create_avatar(plant,plant,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?PLANTS,1)],
-			Poisons=[create_avatar(poison,poison,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?POISONS,1)],
+			Plants=[create_avatar(plant,plant,gen_id(),{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?PLANTS,1)],
+			Poisons=[create_avatar(poison,poison,gen_id(),{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?POISONS,1)],
 			Walls = create_walls(),
 			Plants++Poisons++Walls
 	end.

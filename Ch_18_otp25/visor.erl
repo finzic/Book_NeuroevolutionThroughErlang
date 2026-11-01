@@ -39,13 +39,19 @@
 %%   visor:hud(). visor:freeze(). visor:stats(). visor:stop().
 %% Keys: , . (or [ ]) slower/faster, M max speed on/off, Space/P pause simulation,
 %%       T trails, D death markers, C fitness chart, arrows/drag pan, wheel or +/- zoom, F fit, L legend, H hud,
-%%       Z freeze display only, Q/Esc close.
+%%       Z freeze display only, V simulation console logs on/off (off is faster),
+%%       Q/Esc close this window only, X quit everything (simulation, windows and Erlang).
+%%       G genome window: best prey -> best predator -> closed. Clicking a prey/predator shows its genome.
+%%
+%% Genome window: a separate wx_object (visor_genome_win) draws the selected agent's
+%% neural network; it reads mnesia through throw-away processes, so neither window
+%% ever waits for the database. The agent it shows is ringed in yellow in the arena.
 -module(visor).
 -behaviour(wx_object).
 -include_lib("wx/include/wx.hrl").
 
 -export([start/0, start/1, stop/0]).
--export([speed/1, pause/0, trails/0, deaths/0, chart/0]).
+-export([speed/1, pause/0, trails/0, deaths/0, chart/0, genome/0, genome/1]).
 -export([zo/0, zo/1, fit/0, legend/0, hud/0, freeze/0, fps/1, stats/0, notify/1]).
 -export([ct2color/1, ct_legend/0]).
 -export([init/1, handle_event/2, handle_sync_event/3, handle_call/3, handle_cast/2,
@@ -65,6 +71,8 @@
 -define(DEFAULT_SPEED, 20).
 -define(SPEEDS, [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]).
 -define(TRAIL_LEN, 60).
+-define(CLICK_PX, 4).
+-define(PICK_PX, 18).
 
 -record(state, {
 	frame,
@@ -93,6 +101,11 @@
 	show_chart = true,
 	deaths = visor_deaths:new_marks(),
 	drag,
+	press,
+	genome_win,
+	genome_mon,
+	genome_pid,
+	logs = true,
 	info = #{},
 	meter
 }).
@@ -125,6 +138,11 @@ pause() -> cast({command, toggle_pause}).
 trails() -> cast({command, toggle_trails}).
 deaths() -> cast({command, toggle_deaths}).
 chart() -> cast({command, toggle_chart}).
+%% genome() cycles best prey -> best predator -> off; genome(Sel) picks one directly.
+genome() -> cast({command, cycle_genome}).
+genome(off) -> cast({command, close_genome});
+genome(Morphology) when Morphology == prey; Morphology == predator -> cast({command, {genome, {best, Morphology}}});
+genome(AgentId) -> cast({command, {genome, {agent, AgentId}}}).
 
 fit() -> cast({command, fit}).
 legend() -> cast({command, toggle_legend}).
@@ -177,6 +195,7 @@ init(Opts) ->
 		speed = Speed,
 		watch_speed = case Speed of max -> ?DEFAULT_SPEED; _ -> Speed end,
 		camera = visor_camera:new(),
+		logs = sim_log:enabled(),
 		meter = new_meter(0, #{})
 	},
 	self() ! connect,
@@ -199,6 +218,10 @@ handle_event(#wx{event = #wxKey{type = key_down, keyCode = Code}}, S) ->
 	case key_command(Code) of
 		undefined -> {noreply, S};
 		close -> {stop, normal, S};
+		quit_all ->
+			%% sim:quit/0 stops the simulation, then this window, then the node.
+			spawn(sim, quit, []),
+			{noreply, S};
 		Cmd -> {noreply, command(Cmd, S)}
 	end;
 handle_event(#wx{event = #wxMouse{type = mousewheel, wheelRotation = Rot, x = X, y = Y}}, S) ->
@@ -206,9 +229,12 @@ handle_event(#wx{event = #wxMouse{type = mousewheel, wheelRotation = Rot, x = X,
 	{noreply, command({zoom, Factor, {X, Y}}, S)};
 handle_event(#wx{event = #wxMouse{type = left_down, x = X, y = Y}}, S) ->
 	wxWindow:setFocus(S#state.canvas),
-	{noreply, S#state{drag = {X, Y}}};
+	{noreply, S#state{drag = {X, Y}, press = {X, Y}}};
+handle_event(#wx{event = #wxMouse{type = left_up, x = X, y = Y}}, S = #state{press = {X0, Y0}})
+		when abs(X - X0) =< ?CLICK_PX, abs(Y - Y0) =< ?CLICK_PX ->
+	{noreply, click({X, Y}, S#state{drag = undefined, press = undefined})};
 handle_event(#wx{event = #wxMouse{type = left_up}}, S) ->
-	{noreply, S#state{drag = undefined}};
+	{noreply, S#state{drag = undefined, press = undefined}};
 handle_event(#wx{event = #wxMouse{type = motion, leftDown = true, x = X, y = Y}}, S = #state{drag = {X0, Y0}}) ->
 	{noreply, command({pan, X - X0, Y - Y0}, S#state{drag = {X, Y}})};
 handle_event(#wx{}, S) ->
@@ -242,13 +268,22 @@ handle_info({visor_notify, #{new_population := _} = Info}, S) ->
 	{noreply, refresh(S#state{info = maps:without([new_population], Info), evo = visor_evo:new()})};
 handle_info({visor_notify, #{finished := {Morphology, Fitness, Neurons}} = Info}, S = #state{info = Old, evo = Evo}) ->
 	{noreply, refresh(S#state{info = maps:merge(Old, maps:without([finished], Info)),
-		evo = visor_evo:add(Evo, Morphology, Fitness, Neurons, maps:get(evaluations, Info, undefined))})};
+		evo = visor_evo:add(Evo, Morphology, Fitness, Neurons, maps:get(evaluations, Info, undefined),
+			maps:get(agent_generation, Info, undefined))})};
 handle_info({visor_notify, Info}, S = #state{info = Old}) ->
 	{noreply, refresh(S#state{info = maps:merge(Old, Info)})};
+handle_info({genome_shown, Win, Pid}, S = #state{genome_win = Win}) ->
+	{noreply, refresh(S#state{genome_pid = Pid})};
+handle_info({'DOWN', Mon, process, _Pid, _Reason}, S = #state{genome_mon = Mon}) ->
+	{noreply, refresh(S#state{genome_win = undefined, genome_mon = undefined, genome_pid = undefined})};
 handle_info(_Stale, S) ->
 	{noreply, S}.
 
 terminate(_Reason, S = #state{res = Res}) ->
+	case S#state.genome_win of
+		undefined -> ok;
+		Win -> visor_genome_win:close(Win)
+	end,
 	case S#state.scape of
 		undefined -> ok;
 		Scape -> gen_server:cast(Scape, {self(), unsubscribe})
@@ -278,8 +313,26 @@ command(toggle_hud, S = #state{hud = Hud}) ->
 	refresh(S#state{hud = not Hud});
 command(toggle_legend, S = #state{legend = Legend}) ->
 	refresh(S#state{legend = not Legend});
+command(toggle_logs, S) ->
+	refresh(S#state{logs = sim_log:toggle()});
 command(toggle_freeze, S = #state{frozen = Frozen}) ->
 	refresh(S#state{frozen = not Frozen});
+command(cycle_genome, S = #state{genome_win = undefined}) ->
+	command({genome, {best, prey}}, S);
+command(cycle_genome, S = #state{genome_win = Win}) ->
+	visor_genome_win:cycle(Win),
+	S;
+command(close_genome, S = #state{genome_win = undefined}) ->
+	S;
+command(close_genome, S = #state{genome_win = Win}) ->
+	visor_genome_win:close(Win),
+	S;
+command({genome, Sel}, S = #state{genome_win = undefined}) ->
+	Win = visor_genome_win:start(self(), Sel),
+	S#state{genome_win = Win, genome_mon = erlang:monitor(process, Win)};
+command({genome, Sel}, S = #state{genome_win = Win}) ->
+	visor_genome_win:show(Win, Sel),
+	S;
 command(toggle_chart, S = #state{show_chart = Show}) ->
 	refresh(S#state{show_chart = not Show});
 command(toggle_deaths, S = #state{show_deaths = Show}) ->
@@ -329,6 +382,9 @@ key_command($T) -> toggle_trails;
 key_command($D) -> toggle_deaths;
 key_command($C) -> toggle_chart;
 key_command($Z) -> toggle_freeze;
+key_command($G) -> cycle_genome;
+key_command($V) -> toggle_logs;
+key_command($X) -> quit_all;
 key_command(C) when C == $Q; C == ?WXK_ESCAPE -> close;
 key_command(_) -> undefined.
 
@@ -478,7 +534,20 @@ frame_age(_) -> undefined.
 scene(S = #state{snapshot = Snapshot, camera = Cam, trails = Trails}) ->
 	#{frame => Snapshot, camera => Cam, trails => maps:values(Trails), deaths => death_marks(S),
 	  chart => case S#state.show_chart of true -> visor_evo:chart(S#state.evo); false -> undefined end,
+	  selected => S#state.genome_pid,
 	  hud => hud_lines(S), banner => banner(S)}.
+
+%% A click (press and release without dragging) on a prey/predator inspects its genome.
+click(Point, S = #state{snapshot = #{agents := Agents}, camera = Cam}) ->
+	Near = [{dist2(visor_camera:to_screen(Cam, Loc), Point), Id} || {Id, _Color, Loc} <- Agents, is_pid(Id)],
+	case lists:sort([N || N = {D2, _} <- Near, D2 =< ?PICK_PX * ?PICK_PX]) of
+		[{_, Pid} | _] -> command({genome, {pid, Pid}}, S);
+		[] -> S
+	end;
+click(_Point, S) ->
+	S.
+
+dist2({X0, Y0}, {X1, Y1}) -> (X1 - X0) * (X1 - X0) + (Y1 - Y0) * (Y1 - Y0).
 
 death_marks(#state{speed = max}) ->
 	[];
@@ -502,7 +571,7 @@ hud_lines(S = #state{hud = Hud, legend = Legend}) ->
 
 status_lines(#state{snapshot = Snapshot, camera = {Zoom, _, _}, info = Info, frozen = Frozen,
 		meter = #{rates := R}, fps = Fps, publish_hz = Hz, source = Source,
-		speed = Speed, sim_paused = Paused, deaths = Deaths, evo = Evo}) ->
+		speed = Speed, sim_paused = Paused, deaths = Deaths, evo = Evo, logs = Logs}) ->
 	Stats = case Snapshot of #{stats := St} -> St; _ -> #{} end,
 	Counts = case Snapshot of #{counts := C} -> C; _ -> #{} end,
 	FrozenTag = case Frozen of true -> "  [DISPLAY FROZEN]"; false -> "" end,
@@ -512,20 +581,22 @@ status_lines(#state{snapshot = Snapshot, camera = {Zoom, _, _}, info = Info, fro
 	end,
 	PausedTag = case Paused of true -> "  [SIMULATION PAUSED]"; false -> "" end,
 	[fmt("Scape: ~p~s", [maps:get(scape, Stats, Source), FrozenTag]),
-	 fmt("Speed: ~s~s   , . slower/faster  M max  Space pause  T trails  D deaths  C chart", [SpeedText, PausedTag]),
-	 fmt("Sim: ~p steps/s   tick: ~p", [maps:get(sim_steps_per_s, R, 0), maps:get(ticks, Stats, 0)]),
+	 fmt("Speed: ~s~s   , . slower/faster  M max  Space pause  T trails  D deaths  C chart  G genome", [SpeedText, PausedTag]),
+	 fmt("Sim: ~p steps/s   tick: ~p   console logs: ~s (V)", [maps:get(sim_steps_per_s, R, 0),
+		maps:get(ticks, Stats, 0), case Logs of true -> "on"; false -> "off" end]),
 	 fmt("Frames: published ~p/s (max ~p)  shown ~p/s  skipped ~p/s", [
 		maps:get(frames_published_per_s, R, 0), Hz,
 		maps:get(frames_shown_per_s, R, 0), maps:get(frames_skipped_per_s, R, 0)]),
 	 fmt("View: ~p repaints/s (tick ~p/s)  frame age: ~p ms",
 		[maps:get(view_fps, R, 0), Fps, maps:get(frame_age_ms, R, undefined)])]
-	++ [fmt("Generation: ~p   evaluations: ~p",
-		[maps:get(generation, Info, '-'), maps:get(evaluations, Info, '-')]) || map_size(Info) > 0]
+	++ [fmt("Lineage generation: ~s   evaluations: ~p",
+		[visor_evo:generations_text(Evo, maps:get(generation, Info, undefined)),
+		 maps:get(evaluations, Info, '-')]) || map_size(Info) > 0]
 	++ visor_evo:hud_lines(Evo)
 	++ [visor_deaths:hud_line(Deaths)]
 	++ [fmt("Avatars: ~s", [lists:join("  ",
 		[io_lib:format("~p ~p", [T, N]) || {T, N} <- lists:sort(maps:to_list(Counts))])])]
-	++ [fmt("Zoom ~.3f | arrows/drag pan  wheel,+/- zoom  F fit  L legend  H hud  Z freeze view  Q quit", [Zoom])].
+	++ [fmt("Zoom ~.3f | arrows/drag pan  wheel,+/- zoom  F fit  L legend  H hud  Z freeze view  click: genome  Q close  X quit all", [Zoom])].
 
 fmt(Format, Args) ->
 	unicode:characters_to_list(io_lib:format(Format, Args)).

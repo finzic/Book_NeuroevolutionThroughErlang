@@ -19,7 +19,8 @@
 	camera := visor_camera:camera(),
 	trails => [{atom(), [{number(), number()}]}],
 	deaths => [visor_deaths:primitive()],
-	chart => undefined | {[{atom(), [float()]}], number()},
+	chart => undefined | map(),
+	selected => pid() | undefined,
 	hud := [unicode:chardata()],
 	banner := unicode:chardata() | undefined}.
 -type resources() :: map().
@@ -85,7 +86,8 @@ render(DC, {W, H} = Size, Scene, Res) ->
 				Cam = maps:get(camera, Scene),
 				draw_trails(GC, Cam, maps:get(trails, Scene, []), Res),
 				draw_shapes(GC, Size, Cam, Shapes, Res),
-				draw_deaths(GC, Cam, maps:get(deaths, Scene, []), Res)
+				draw_deaths(GC, Cam, maps:get(deaths, Scene, []), Res),
+				draw_selected(GC, Cam, maps:get(selected, Scene, undefined), maps:get(frame, Scene))
 		end,
 		draw_hud(GC, maps:get(hud, Scene), Res),
 		draw_chart(GC, Size, maps:get(chart, Scene, undefined), Res),
@@ -204,13 +206,32 @@ rgba({R, G, B}, Alpha) ->
 
 %%==================================================================== overlays
 
+%% Yellow ring around the avatar whose genome is shown (when it is in the arena).
+draw_selected(_GC, _Cam, undefined, _Frame) ->
+	ok;
+draw_selected(GC, Cam, Pid, #{agents := Agents}) ->
+	case lists:keyfind(Pid, 1, Agents) of
+		{Pid, _Color, Loc} ->
+			{X, Y} = visor_camera:to_screen(Cam, Loc),
+			R = ?RING_MIN_PX * 2.5,
+			with_pen(GC, {230, 200, 0}, 1.0, 3, ?wxPENSTYLE_SOLID, fun() ->
+				wxGraphicsContext:setBrush(GC, ?wxTRANSPARENT_BRUSH),
+				wxGraphicsContext:drawEllipse(GC, X - R, Y - R, 2 * R, 2 * R)
+			end);
+		false ->
+			ok
+	end;
+draw_selected(_GC, _Cam, _Pid, _Frame) ->
+	ok.
+
 -define(CHART_W, 440).
 -define(CHART_H, 220).
 
 %% Bottom-right panel. All species share the x axis (population evaluations) so the
 %% predator/prey arms race reads side by side. Per species, in its colour:
-%%   thick solid = long moving average (the trend), thin faint = short moving
-%%   average (noisy), dashed step line = best fitness ever reached.
+%%   thick solid = long moving median (the trend), thin faint = short moving
+%%   median, and one dot per finished agent (clamped at the top edge when above the axis).
+%%   The y axis fits typical values; best ever is in the HUD text.
 draw_chart(_GC, _Size, undefined, _Res) ->
 	ok;
 draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMax,
@@ -226,7 +247,7 @@ draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMa
 	wxGraphicsContext:setFont(GC, Font, {255, 255, 255}),
 	wxGraphicsContext:drawText(GC, "Fitness of finished agents", X0 + 8, Y0 + 5),
 	wxGraphicsContext:setFont(GC, Small, {220, 220, 220}),
-	wxGraphicsContext:drawText(GC, io_lib:format("thick: avg of last ~p   thin: avg of last ~p   dashed: best ever",
+	wxGraphicsContext:drawText(GC, io_lib:format("dots: agents   thick: median of last ~p   thin: of last ~p",
 		[Long, Short]), X0 + 8, Y0 + 24),
 	wxGraphicsContext:drawText(GC, io_lib:format("~.2f", [float(YMax)]), X0 + 4, PY - 6),
 	wxGraphicsContext:drawText(GC, "0", X0 + 24, PY + PH - 6),
@@ -244,11 +265,11 @@ draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMa
 		end)
 	end,
 	lists:foldl(
-		fun(#{morphology := Morphology, short := ShortPs, long := LongPs, best := BestPs}, LegendX) ->
+		fun(#{morphology := Morphology, short := ShortPs, long := LongPs, dots := Dots}, LegendX) ->
 			RGB = chart_rgb(Morphology),
+			draw_dots(GC, RGB, [ToScreen({X, min(Y, YMax)}) || {X, Y} <- Dots]),
 			Stroke(RGB, 0.45, 1, ?wxPENSTYLE_SOLID, ShortPs),
 			Stroke(RGB, 1.0, 3, ?wxPENSTYLE_SOLID, LongPs),
-			Stroke(RGB, 0.9, 1, ?wxPENSTYLE_SHORT_DASH, BestPs),
 			wxGraphicsContext:setFont(GC, Small, RGB),
 			Label = atom_to_list(Morphology),
 			wxGraphicsContext:drawText(GC, Label, LegendX, PY + 2),
@@ -256,6 +277,14 @@ draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMa
 			LegendX + LW + 12
 		end, PX + 8, Series),
 	ok.
+
+draw_dots(GC, {R, G, B}, Points) ->
+	Brush = wxBrush:new({R, G, B, 110}),
+	with_pen(GC, {R, G, B}, 0.0, 1, ?wxPENSTYLE_SOLID, fun() ->
+		wxGraphicsContext:setBrush(GC, Brush),
+		[wxGraphicsContext:drawEllipse(GC, X - 2, Y - 2, 4, 4) || {X, Y} <- Points]
+	end),
+	wxBrush:destroy(Brush).
 
 %% The chart sits on the dark HUD panel, so it uses brighter tints than the scene.
 chart_rgb(prey) -> {120, 200, 255};

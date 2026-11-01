@@ -8,7 +8,7 @@
 -module(population_monitor).
 -include("records.hrl").
 %% API
--export([start_link/1,start_link/0,start/1,start/0,stop/0,init/2]).
+-export([continue/2, start_link/1,start_link/0,start/1,start/0,stop/0,init/2,active_agents/0]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,create_MutantAgentCopy/1,test/0, create_specie/3, continue/0, continue/1, init_population/2, prep_PopState/2, extract_AgentIds/2,delete_population/1]).
 -behaviour(gen_server).
@@ -36,8 +36,8 @@
 	selection_algorithm,
 	best_fitness,
 	survival_percentage = 0.5,
-	specie_size_limit = 10,
-	init_specie_size = 10,
+	specie_size_limit = 20,
+	init_specie_size = 20,
 	polis_id = mathema,
 	generation_limit = 100,
 	evaluations_limit = 100000,
@@ -64,6 +64,13 @@ start() ->
 
 stop() ->
 	gen_server:cast(monitor,{stop,normal}).
+
+%[{Agent_Id,Exoself_PId}] of the agents currently being evaluated (the exoself pid is also the avatar id in
+%the scape). Used by the visor to map a clicked avatar to its genome; [] if no monitor answers in time.
+active_agents()->
+	try gen_server:call(monitor,active_agents,500)
+	catch exit:_ -> []
+	end.
 	
 init(Pid,InitState)->
 	gen_server:cast(Pid,{init,InitState}).
@@ -82,7 +89,7 @@ init(S) ->
 	Population_Id = S#state.population_id,
 	OpMode = S#state.op_mode,
 	io:format("******** Population monitor started with parameters:~p~n",[S]),
-	Agent_Ids = extract_AgentIds(Population_Id,all),
+	Agent_Ids = extract_AgentIds(Population_Id,active),
 	ActiveAgent_IdPs = summon_agents(OpMode,Agent_Ids),
 	P = genotype:dirty_read({population,Population_Id}),
 	[put({evaluations,Specie_Id},0) || Specie_Id<-P#population.specie_ids],
@@ -114,6 +121,8 @@ init(S) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
+handle_call(active_agents,_From,S)->
+	{reply,S#state.activeAgent_IdPs,S};
 handle_call({stop,normal},_From, S)->
 	ActiveAgent_IdPs = S#state.activeAgent_IdPs,
 	[Agent_PId ! {self(),terminate} || {_DAgent_Id,Agent_PId}<-ActiveAgent_IdPs],
@@ -257,7 +266,7 @@ handle_cast({op_tag,pause},S) when S#state.op_tag == continue ->
 handle_cast({op_tag,continue},S) when S#state.op_tag == pause ->
 	Population_Id = S#state.population_id,
 	OpMode = S#state.op_mode,
-	Agent_Ids = extract_AgentIds(Population_Id,all),
+	Agent_Ids = extract_AgentIds(Population_Id,active),
 	U_ActiveAgent_IdPs=summon_agents(OpMode,Agent_Ids),
 	TotAgents=length(Agent_Ids),
 	U_S=S#state{activeAgent_IdPs=U_ActiveAgent_IdPs,tot_agents=TotAgents,agents_left=TotAgents,op_tag=continue},
@@ -375,7 +384,9 @@ extract_AgentIds(Population_Id,AgentType)->
 		champions ->
 			extract_ChampionAgentIds(Specie_Ids,[]);
 		all ->
-			extract_AllAgentIds(Specie_Ids,[])
+			extract_AllAgentIds(Specie_Ids,[]);
+		active ->
+			extract_ActiveAgentIds(Specie_Ids,[])
 	end.
 %The extract_AgentIds/2 function accepts the Population_Id and a parameter which specifies what type of agents (all agent ids, or just those of the champions) to extract from the population, after which it extracts those agents. Depending on the AgentType parameter, the function either calls extract_ChampionAgentIds/2 or extract_AllAgentIds/2, which return the list of agent ids to the caller.
 
@@ -387,6 +398,17 @@ extract_AgentIds(Population_Id,AgentType)->
 		Acc.
 %extract_ChampionAgentIds/2 accumulates the ids of champion agents from every specie in the Specie_Ids list, and then returns that list to the caller.
 	
+	%A steady_state specie lists both its dead pool (already evaluated parents, kept with their
+	%fitness) and the agents still being evaluated in agent_ids. Only the latter need to run when
+	%a population is summoned again; re-running the dead pool would put its members in the pool
+	%twice, and the culling could then delete an agent that is still listed there.
+	extract_ActiveAgentIds([Specie_Id|Specie_Ids],Acc)->
+		S = genotype:dirty_read({specie,Specie_Id}),
+		{_,_,DeadPool_Ids} = lists:unzip3(S#specie.dead_pool),
+		extract_ActiveAgentIds(Specie_Ids,lists:append(S#specie.agent_ids -- DeadPool_Ids,Acc));
+	extract_ActiveAgentIds([],Acc)->
+		Acc.
+
 	extract_AllAgentIds([Specie_Id|Specie_Ids],Acc)->
 		extract_AllAgentIds(Specie_Ids,lists:append(extract_SpecieAgentIds(Specie_Id),Acc));
 	extract_AllAgentIds([],Acc)->
@@ -420,6 +442,7 @@ visor_report(Agent_Id,Fitness,S)->
 				Cx = genotype:dirty_read({cortex,A#agent.cx_id}),
 				Morphology = (A#agent.constraint)#constraint.morphology,
 				visor:notify(#{finished => {Morphology,Fitness,length(Cx#cortex.neuron_ids)},
+					agent_generation => A#agent.generation,
 					evaluations => S#state.tot_evaluations})
 			catch
 				_:_ -> ok
@@ -511,6 +534,16 @@ continue(Population_Id)->
 	S = #state{population_id=Population_Id,op_mode = [gt,benchmark]},
 	population_monitor:start(S).
 %The function continue/0 and continue/1 are used to summon an already existing population with either the default population Id, or the specified Population_Id.
+
+%Like continue/1, but allows MoreEvaluations evaluations beyond those the population has already done
+%(the book's continue/1 keeps the default limit, so a population that reached it stops again at once).
+continue(Population_Id,MoreEvaluations)->
+	rand:seed(exsss),
+	P = genotype:dirty_read({population,Population_Id}),
+	Done = (P#population.trace)#trace.tot_evaluations,
+	Limit = case MoreEvaluations of infinity -> infinity; _ -> Done+MoreEvaluations end,
+	io:format("******** Continuing population ~p after ~p evaluations, limit ~p~n",[Population_Id,Done,Limit]),
+	population_monitor:start(#state{population_id=Population_Id,op_mode=gt,evaluations_limit=Limit}).
 
 mutate_population(Population_Id,KeepTot,Fitness_Postprocessor,Selection_Algorithm)->
 	NeuralEnergyCost = calculate_EnergyCost(Population_Id),

@@ -10,6 +10,10 @@
 -include("records.hrl").
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Get Init Standard Actuators/Sensors %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Flatland agents start with every sensor (distance and colour), so they can tell what they see from
+%the first generation instead of waiting for an add_sensor mutation.
+get_InitSensors(Morphology) when Morphology == prey; Morphology == predator ->
+	morphology:Morphology(sensors);
 get_InitSensors(Morphology)->
 	Sensors = morphology:Morphology(sensors),
 	[lists:nth(1,Sensors)].
@@ -118,12 +122,17 @@ discrete_tmaze(actuators)->
 predator(actuators)->
 	prey(actuators);
 predator(sensors)->
-	prey(sensors).
+	scanners().
+
 
 prey(actuators)->
 	Movement = [#actuator{name=two_wheels,type=standard,scape={public,flatland},format=no_geo,vl=2,parameters=[2]}],
 	Movement;
 prey(sensors)->
+	%Prey also get the threat scanner, so they can tell where the nearest predator is and flee it.
+	scanners() ++ [#sensor{name=threat_scanner,type=standard,scape={public,flatland},format=no_geo,vl=3,parameters=[]}].
+
+scanners()->
 	Pi = math:pi(),
 	Distance_Scanners = [#sensor{name=distance_scanner,type=standard,scape={public,flatland},format=no_geo,vl=Density,parameters=[Spread,Density,ROffset]} || 
 		Spread<-[Pi/2],Density<-[5], ROffset<-[Pi*0/2]],
@@ -132,7 +141,9 @@ prey(sensors)->
 	Energy_Scanners = [#sensor{name=energy_scanner,type=standard,scape={public,flatland},format=no_geo,vl=Density,parameters=[Spread,Density,ROffset]} ||
 		Spread <-[Pi/2], Density <-[5], ROffset<-[Pi*0/2]],
 	Stat_Readers = [#sensor{name=Name,type=standard,scape={public,flatland},format=no_geo,vl=Density,parameters=Param} || {Name,Density,Param} <- [{energy_reader,1,[]}]],
-	Distance_Scanners.
+	%The colour scanner tells what each ray hits (prey 0, predator 0.5, plant -0.5, poison -1, wall 0.75, nothing 1);
+	%with distances alone an agent cannot tell food, poison, prey, predators and walls apart.
+	Distance_Scanners ++ Color_Scanners.
 	
 generate_id() ->
 	genotype:generate_UniqueId().
