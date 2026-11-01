@@ -24,6 +24,15 @@
 %Enclosing arena [{XMin,XMax},{YMin,YMax}]: walled in by create_walls/0, enforced by check_borders/2.
 %It encloses every spawn area (plants/prey 800x500, predators 300..700).
 -define(ARENA,[{0,820},{0,720}]).
+-define(PLANTS,50).
+-define(POISONS,50).
+%Plants and poisons spawn anywhere in the arena except a stripe this wide along every border.
+-define(FOOD_MARGIN,20).
+%Random interior walls: ?WALL_SHAPES pieces, each 1..3 connected sides at right angles
+%(bar, L, U or Z), never touching each other or the arena border, so no closed box can form.
+-define(WALL_SHAPES,7).
+-define(WALL_LEN,{60,220}).
+-define(WALL_CLEARANCE,40).
 %%==================================================================== API
 %%--------------------------------------------------------------------
 %% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
@@ -646,7 +655,7 @@ create_avatar(Morphology,Specie_Id,Avatar_Id,{InitEnergy,InitLoc},RespawnFlag,Me
 			%{X,Y} = Loc = {rand:uniform(5000),rand:uniform(5000)},
 			case InitLoc of
 				undefined ->
-					{X,Y} = Loc = {rand:uniform(800),rand:uniform(500)};
+					{X,Y} = Loc = food_loc();
 				Val ->
 					{X,Y} = Loc = Val
 			end,
@@ -684,7 +693,7 @@ create_avatar(Morphology,Specie_Id,Avatar_Id,{InitEnergy,InitLoc},RespawnFlag,Me
 			Direction={1/math:sqrt(2),1/math:sqrt(2)},
 			case InitLoc of
 				undefined ->
-					{X,Y} = Loc = {rand:uniform(800),rand:uniform(500)};
+					{X,Y} = Loc = food_loc();
 				Val ->
 					{X,Y} = Loc = Val
 			end,
@@ -777,7 +786,7 @@ destroy_avatar(ExoSelf_PId,State)->
 
 respawn_avatar(A)->
 %	io:format("Respawning:~p~n",[A]),
-	{X,Y} = {rand:uniform(800),rand:uniform(500)},
+	{X,Y} = food_loc(),
 	case A#avatar.type of
 		plant ->
 			A#avatar{
@@ -813,10 +822,15 @@ respawn_avatar(Avatars,A)->
 			}
 	end.
 
+	food_loc()->
+		[{XMin,XMax},{YMin,YMax}] = ?ARENA,
+		M = ?FOOD_MARGIN,
+		{XMin+M+rand:uniform(XMax-XMin-2*M)-1,YMin+M+rand:uniform(YMax-YMin-2*M)-1}.
+
 	return_valid(OAvatars)->
-		case return_valid(OAvatars,{rand:uniform(800),rand:uniform(500)}) of
+		case return_valid(OAvatars,food_loc()) of
 			undefined ->
-				return_valid(OAvatars,{rand:uniform(800),rand:uniform(500)});
+				return_valid(OAvatars,food_loc());
 			Loc ->
 				Loc
 		end.
@@ -953,13 +967,13 @@ world_init(World_Type,Physics,Metabolics)->
 	case World_Type of
 		flatland ->
 			Walls = create_walls(),
-			Plants=[create_avatar(plant,plant,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(10,1)],
-			Poisons=[create_avatar(poison,poison,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(10,1)],
+			Plants=[create_avatar(plant,plant,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(?PLANTS,1)],
+			Poisons=[create_avatar(poison,poison,gen_id(),{undefined,return_valid([])},respawn,Metabolics)||_<-lists:duplicate(?POISONS,1)],
 			Plants++Walls++Poisons;
 		baator ->
 			Id=genotype:generate_UniqueId(),
-			Plants=[create_avatar(plant,plant,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(10,1)],
-			Poisons=[create_avatar(poison,poison,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(10,1)],
+			Plants=[create_avatar(plant,plant,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?PLANTS,1)],
+			Poisons=[create_avatar(poison,poison,Id,{undefined,undefined},respawn,Metabolics)|| _<-lists:duplicate(?POISONS,1)],
 			Walls = create_walls(),
 			Plants++Poisons++Walls
 	end.
@@ -1294,20 +1308,67 @@ create_rocks()->
 	],
 	[create_avatar(rock,rock,gen_id(),undefined,Rock_Loc,undefined) || Rock_Loc <- Rock_Locs].
 
+random_walls(Arena)->
+	random_walls(Arena,?WALL_SHAPES,200,[]).
+random_walls(_Arena,0,_Tries,Acc)->
+	lists:append(Acc);
+random_walls(_Arena,_Left,0,Acc)->
+	lists:append(Acc);
+random_walls(Arena,Left,Tries,Acc)->
+	Shape = random_wall_shape(Arena),
+	Clear = lists:all(fun(Seg)-> inside_arena(Seg,Arena) andalso
+		lists:all(fun(Other)-> wall_distance(Seg,Other) >= ?WALL_CLEARANCE end,lists:append(Acc)) end,Shape),
+	case Clear of
+		true -> random_walls(Arena,Left-1,Tries-1,[Shape|Acc]);
+		false -> random_walls(Arena,Left,Tries-1,Acc)
+	end.
+
+%A polyline of 1..3 sides whose directions alternate between horizontal and vertical.
+random_wall_shape([{XMin,XMax},{YMin,YMax}])->
+	Start = {XMin+rand:uniform(XMax-XMin),YMin+rand:uniform(YMax-YMin)},
+	FirstAxis = lists:nth(rand:uniform(2),[x,y]),
+	wall_polyline(Start,FirstAxis,rand:uniform(3),[]).
+
+wall_polyline(_Point,_Axis,0,Acc)->
+	lists:reverse(Acc);
+wall_polyline({X,Y},Axis,Sides,Acc)->
+	{LMin,LMax} = ?WALL_LEN,
+	Len = (LMin+rand:uniform(LMax-LMin))*lists:nth(rand:uniform(2),[1,-1]),
+	case Axis of
+		x -> wall_polyline({X+Len,Y},y,Sides-1,[{x_wall,{Y,min(X,X+Len),max(X,X+Len)}}|Acc]);
+		y -> wall_polyline({X,Y+Len},x,Sides-1,[{y_wall,{X,min(Y,Y+Len),max(Y,Y+Len)}}|Acc])
+	end.
+
+wall_box({x_wall,{Y,X0,X1}})-> {X0,Y,X1,Y};
+wall_box({y_wall,{X,Y0,Y1}})-> {X,Y0,X,Y1}.
+
+%Keeps a gap to the border walls too, otherwise a U against the border would close a box.
+inside_arena(Seg,[{XMin,XMax},{YMin,YMax}])->
+	{X0,Y0,X1,Y1} = wall_box(Seg),
+	C = ?WALL_CLEARANCE,
+	(X0 >= XMin+C) and (X1 =< XMax-C) and (Y0 >= YMin+C) and (Y1 =< YMax-C).
+
+wall_distance(A,B)->
+	{AX0,AY0,AX1,AY1} = wall_box(A),
+	{BX0,BY0,BX1,BY1} = wall_box(B),
+	DX = lists:max([0,BX0-AX1,AX0-BX1]),
+	DY = lists:max([0,BY0-AY1,AY0-BY1]),
+	math:sqrt(DX*DX+DY*DY).
+
 arena_walls([{XMin,XMax},{YMin,YMax}])->
 	[{x_wall,{YMin,XMin,XMax}},{x_wall,{YMax,XMin,XMax}},{y_wall,{XMin,YMin,YMax}},{y_wall,{XMax,YMin,YMax}}].
 
-create_walls()->
-	Sections =[
+%The book's original fixed layout, kept for reference.
+book_walls()->
+	[
 		{x_wall,{300,100,200}},
 		{y_wall,{250,100,500}},
 		{x_wall,{200,400,450}},
 		{y_wall,{400,200,300}},
-		%{x_wall,{300,400,450}},
-		%{x_wall,{250,450,600}},
-		%{y_wall,{700,200,400}},
-		%{x_wall,{400,450,500}},
 		{y_wall,{500,400,500}},
 		{x_wall,{500,450,500}}
-	] ++ arena_walls(?ARENA),	
+	].
+
+create_walls()->
+	Sections = random_walls(?ARENA) ++ arena_walls(?ARENA),
 	[create_avatar(wall,wall,gen_id(),undefined,Section_Loc,undefined) || Section_Loc <- Sections].
