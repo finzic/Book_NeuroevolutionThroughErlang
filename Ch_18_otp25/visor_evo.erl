@@ -22,17 +22,19 @@
 %%     Medians, not means: a single lucky kill bonus does not move them, so the
 %%     y axis stays fitted to typical agents.
 %%     The best fitness ever reached is only in the HUD line: as a chart line its rare
-%%     outliers squashed the averages to the bottom of the plot.
+%%     outliers squashed the averages to the bottom of the plot. The dashed line is the
+%%     median fitness of each species' pool of survivors, the real progress of a
+%%     steady-state evolution; like the dots it never sets the y axis.
 -module(visor_evo).
 
--export([new/0, add/5, add/6, generations_text/2, hud_lines/1, chart/1, total/1]).
+-export([new/0, add/5, add/6, add_pool/4, generations_text/2, hud_lines/1, chart/1, total/1]).
 -export_type([evo/0, chart/0]).
 
 -type point() :: {number(), number()}.
 -type series() :: #{n := non_neg_integer(), points := [point()], first := [number()],
 	best := number(), neurons := [non_neg_integer()]}.
 -opaque evo() :: #{atom() => series()}.
--type chart() :: #{series := [#{morphology := atom(), short := [point()], long := [point()], dots := [point()]}],
+-type chart() :: #{series := [#{morphology := atom(), short := [point()], long := [point()], dots := [point()], pool := [point()]}],
 	x_range := {number(), number()}, y_max := number(), short := pos_integer(), long := pos_integer()}.
 
 -define(KEEP, 5000).
@@ -72,6 +74,19 @@ add(Evo, Morphology, Fitness, Neurons, Evaluations, Generation) when is_number(F
 add(Evo, _Morphology, _Fitness, _Neurons, _Evaluations, _Generation) ->
 	Evo.
 
+%% The median fitness in the morphology's pool of survivors, at the given evaluation count.
+%% Ignored until the morphology has reported a finished agent.
+-spec add_pool(evo(), atom(), number(), number() | undefined) -> evo().
+add_pool(Evo, Morphology, Best, Evaluations) when is_number(Best), is_number(Evaluations) ->
+	case Evo of
+		#{Morphology := S} ->
+			Evo#{Morphology := S#{pool => lists:sublist([{Evaluations, Best} | maps:get(pool, S, [])], ?KEEP)}};
+		_ ->
+			Evo
+	end;
+add_pool(Evo, _Morphology, _Best, _Evaluations) ->
+	Evo.
+
 %% "prey 143, predator 97"; the population's own generation (generational algorithm)
 %% when there is one, "-" when nothing is known yet.
 -spec generations_text(evo(), term()) -> string().
@@ -103,8 +118,8 @@ line(Morphology, #{n := N, points := Points, first := First, best := Best, neuro
 
 -spec chart(evo()) -> chart() | undefined.
 chart(Evo) ->
-	Series = [series(M, lists:reverse(Points)) || {M, #{points := Points}} <- lists:sort(maps:to_list(Evo)),
-		length(Points) >= 2],
+	Series = [series(M, lists:reverse(Points), lists:reverse(maps:get(pool, S, []))) ||
+		{M, #{points := Points} = S} <- lists:sort(maps:to_list(Evo)), length(Points) >= 2],
 	case Series of
 		[] ->
 			undefined;
@@ -121,10 +136,12 @@ chart(Evo) ->
 
 %% The chart is rebuilt on every repaint, so medians are computed only at the
 %% (at most ?CHART_POINTS + 1) indices that get plotted.
-series(Morphology, Points) ->
+series(Morphology, Points, Pool) ->
 	T = list_to_tuple(Points),
 	Is = sample_indices(tuple_size(T)),
+	PT = list_to_tuple(Pool),
 	#{morphology => Morphology,
+	  pool => [element(I, PT) || I <- sample_indices(tuple_size(PT))],
 	  short => [{element(1, element(I, T)), median_at(T, I, ?SHORT)} || I <- Is],
 	  long => [{element(1, element(I, T)), median_at(T, I, ?LONG)} || I <- Is],
 	  dots => [element(I, T) || I <- sample_indices(tuple_size(T), ?DOTS)]}.

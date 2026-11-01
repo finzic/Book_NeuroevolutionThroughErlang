@@ -230,8 +230,9 @@ draw_selected(_GC, _Cam, _Pid, _Frame) ->
 %% Bottom-right panel. All species share the x axis (population evaluations) so the
 %% predator/prey arms race reads side by side. Per species, in its colour:
 %%   thick solid = long moving median (the trend), thin faint = short moving
-%%   median, and one dot per finished agent (clamped at the top edge when above the axis).
-%%   The y axis fits typical values; best ever is in the HUD text.
+%%   median, one dot per finished agent (clamped at the top edge when above the axis) and
+%%   a dashed line for the median fitness of the species' pool of survivors (the real progress).
+%%   The y axis fits the dots' typical values and the medians; best ever is in the HUD text.
 draw_chart(_GC, _Size, undefined, _Res) ->
 	ok;
 draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMax,
@@ -247,7 +248,7 @@ draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMa
 	wxGraphicsContext:setFont(GC, Font, {255, 255, 255}),
 	wxGraphicsContext:drawText(GC, "Fitness of finished agents", X0 + 8, Y0 + 5),
 	wxGraphicsContext:setFont(GC, Small, {220, 220, 220}),
-	wxGraphicsContext:drawText(GC, io_lib:format("dots: agents   thick: median of last ~p   thin: of last ~p",
+	wxGraphicsContext:drawText(GC, io_lib:format("dots: agents  thick: median of last ~p  thin: of last ~p  dashed: pool median",
 		[Long, Short]), X0 + 8, Y0 + 24),
 	wxGraphicsContext:drawText(GC, io_lib:format("~.2f", [float(YMax)]), X0 + 4, PY - 6),
 	wxGraphicsContext:drawText(GC, "0", X0 + 24, PY + PH - 6),
@@ -265,11 +266,12 @@ draw_chart(GC, {W, H}, #{series := Series, x_range := {XMin, XMax}, y_max := YMa
 		end)
 	end,
 	lists:foldl(
-		fun(#{morphology := Morphology, short := ShortPs, long := LongPs, dots := Dots}, LegendX) ->
+		fun(#{morphology := Morphology, short := ShortPs, long := LongPs, dots := Dots, pool := PoolPs}, LegendX) ->
 			RGB = chart_rgb(Morphology),
 			draw_dots(GC, RGB, [ToScreen({X, min(Y, YMax)}) || {X, Y} <- Dots]),
 			Stroke(RGB, 0.45, 1, ?wxPENSTYLE_SOLID, ShortPs),
 			Stroke(RGB, 1.0, 3, ?wxPENSTYLE_SOLID, LongPs),
+			Stroke(RGB, 1.0, 2, ?wxPENSTYLE_SHORT_DASH, [{X, min(Y, YMax)} || {X, Y} <- PoolPs]),
 			wxGraphicsContext:setFont(GC, Small, RGB),
 			Label = atom_to_list(Morphology),
 			wxGraphicsContext:drawText(GC, Label, LegendX, PY + 2),

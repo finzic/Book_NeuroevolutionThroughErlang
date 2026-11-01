@@ -232,6 +232,7 @@ handle_cast({Agent_Id,terminated,Fitness},S) when S#state.evolutionary_algorithm
 					ProperlySorted_AgentSummaries
 			end,
 			io:format("Valid_AgentSummaries:~p~n",[Valid_AgentSummaries]),
+			visor_pool(Morphology,Valid_AgentSummaries,S),
 			{WinnerFitness,WinnerProfile,WinnerAgent_Id} = selection_algorithm:SelectionAlgorithmName(Valid_AgentSummaries),
 			ActiveAgent_IdP = case rand:uniform() < 0.1 of
 				true ->
@@ -446,6 +447,24 @@ visor_report(Agent_Id,Fitness,S)->
 					evaluations => S#state.tot_evaluations})
 			catch
 				_:_ -> ok
+			end
+	end.
+
+%The median fitness in the specie's pool after each finished agent: the real progress of the
+%evolution, unlike the fitness of the newly finished (mostly mutant) agents. The median, not
+%the best: one lucky agent (fitness 50) would flatten everything else on the chart. One message per
+%finished agent, and only when a visor is open.
+visor_pool(Morphology,Summaries,S)->
+	case whereis(visor) of
+		undefined ->
+			ok;
+		_ ->
+			Fitnesses = [F || {F,_,_} <- Summaries, is_number(F)],
+			case Fitnesses of
+				[] -> ok;
+				_ ->
+					Sorted = lists:sort(Fitnesses),
+					visor:notify(#{pool => {Morphology,lists:nth((length(Sorted)+1) div 2,Sorted)},evaluations => S#state.tot_evaluations})
 			end
 	end.
 

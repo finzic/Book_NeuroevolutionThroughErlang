@@ -30,9 +30,9 @@
 -define(FOOD_MARGIN,20).
 -define(PREY_STEP_FITNESS,0.001).
 -define(PREDATOR_STEP_FITNESS,0.0001).
-%A prey speared by a predator loses this much fitness: far more than the 0.001 per step it
-%earns by surviving (20 for the longest possible life, a few for a typical one).
--define(PREY_DEATH_PENALTY,5).
+%A prey speared by a predator loses this much fitness: more than the 0.001 per step it
+%earns by surviving (a typical life earns about 1-5, the longest possible 20).
+-define(PREY_DEATH_PENALTY,1).
 %Random interior walls: ?WALL_SHAPES pieces, each 1..3 connected sides at right angles
 %(bar, L, U or Z), never touching each other or the arena border, so no closed box can form.
 -define(WALL_SHAPES,7).
@@ -1196,7 +1196,9 @@ world_behavior(Collision,Penetration,OAvatar,Avatar)->
 					Avatar
 			end,
 			{0,void,OAvatar,U_Avatar};
-		(OAType == predator) and ((AType == plant) or (AType == poison)) and (Collision == true)->
+		(OAType == predator) and (AType == poison) and (Collision == true)->%poison hurts predators too
+			{Avatar#avatar.energy,poison_eaten,OAvatar,Avatar};
+		(OAType == predator) and (AType == plant) and (Collision == true)->
 			U_Avatar=case ?COLLISIONS of
 				on ->
 					PushStrength = 0,%Push_asside

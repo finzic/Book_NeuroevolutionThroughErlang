@@ -270,6 +270,9 @@ handle_info({visor_notify, #{finished := {Morphology, Fitness, Neurons}} = Info}
 	{noreply, refresh(S#state{info = maps:merge(Old, maps:without([finished], Info)),
 		evo = visor_evo:add(Evo, Morphology, Fitness, Neurons, maps:get(evaluations, Info, undefined),
 			maps:get(agent_generation, Info, undefined))})};
+handle_info({visor_notify, #{pool := {Morphology, Best}} = Info}, S = #state{info = Old, evo = Evo}) ->
+	{noreply, refresh(S#state{info = maps:merge(Old, maps:without([pool], Info)),
+		evo = visor_evo:add_pool(Evo, Morphology, Best, maps:get(evaluations, Info, undefined))})};
 handle_info({visor_notify, Info}, S = #state{info = Old}) ->
 	{noreply, refresh(S#state{info = maps:merge(Old, Info)})};
 handle_info({genome_shown, Win, Pid}, S = #state{genome_win = Win}) ->
